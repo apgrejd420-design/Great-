@@ -1,0 +1,172 @@
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const path = require('path');
+const fs = require('fs');
+
+const PORT = process.env.PORT || 3000;
+const MAX_USERS = 12;
+const ADMIN_USERNAME = 'great_228';
+
+const DB_FILE = path.join(__dirname, 'users.json');
+function loadDB() {
+  if (!fs.existsSync(DB_FILE)) return { users: {}, chats: {} };
+  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
+  catch { return { users: {}, chats: {} }; }
+}
+function saveDB() {
+  try { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); } catch(e) { console.log('Не удалось сохранить БД'); }
+}
+let db = loadDB();
+
+if (!db.users[ADMIN_USERNAME]) {
+  db.users[ADMIN_USERNAME] = {
+    username: ADMIN_USERNAME,
+    role: 'admin',
+    blocked: false,
+    createdAt: Date.now()
+  };
+  saveDB();
+}
+
+const app = express();
+app.use(express.static(path.join(__dirname, 'public')));
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+const online = new Map();
+
+function send(ws, data) { if (ws.readyState === 1) ws.send(JSON.stringify(data)); }
+function broadcast(data) { for (const ws of online.values()) send(ws, data); }
+
+function userPublic(u) {
+  return { username: u.username, role: u.role, blocked: !!u.blocked, online: online.has(u.username) };
+}
+function chatKey(a, b) { return [a, b].sort().join('::'); }
+
+wss.on('connection', (ws) => {
+  let me = null;
+
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    if (msg.type === 'register') {
+      const name = String(msg.username || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+      if (name.length < 3) { return send(ws, { type: 'error', text: 'Минимум 3 символа' }); }
+
+      let user = db.users[name];
+      if (!user) {
+        const count = Object.keys(db.users).length;
+        if (count >= MAX_USERS) {
+          return send(ws, { type: 'error', text: 'Достигнут лимит 12 пользователей' });
+        }
+        user = { username: name, role: 'user', blocked: false, createdAt: Date.now() };
+        db.users[name] = user;
+        saveDB();
+      }
+      if (user.blocked) {
+        return send(ws, { type: 'error', text: 'Аккаунт заблокирован админом' });
+      }
+      me = name;
+      online.set(name, ws);
+      send(ws, { type: 'auth_ok', me: userPublic(user) });
+      broadcast({ type: 'online_list', users: Object.values(db.users).map(userPublic) });
+      return;
+    }
+
+    if (!me) return send(ws, { type: 'error', text: 'Сначала войдите' });
+
+    const meUser = db.users[me];
+
+    if (msg.type === 'open_chat') {
+      const other = String(msg.with || '').toLowerCase();
+      if (!db.users[other]) return send(ws, { type: 'error', text: 'Пользователь не найден' });
+      const key = chatKey(me, other);
+      if (!db.chats[key]) db.chats[key] = { participants: [me, other].sort(), messages: [] };
+      send(ws, {
+        type: 'chat_history',
+        with: other,
+        messages: db.chats[key].messages
+      });
+      return;
+    }
+
+    if (msg.type === 'send_message') {
+      const other = String(msg.to || '').toLowerCase();
+      const text = String(msg.text || '').trim().slice(0, 2000);
+      if (!text || !db.users[other]) return;
+      const key = chatKey(me, other);
+      if (!db.chats[key]) db.chats[key] = { participants: [me, other].sort(), messages: [] };
+      const message = { from: me, to: other, text, time: Date.now() };
+      db.chats[key].messages.push(message);
+      saveDB();
+      if (online.has(other)) send(online.get(other), { type: 'new_message', message });
+      send(ws, { type: 'new_message', message });
+      return;
+    }
+
+    if (meUser.role === 'admin') {
+      if (msg.type === 'admin_users') {
+        return send(ws, { type: 'admin_users', users: Object.values(db.users).map(userPublic) });
+      }
+      if (msg.type === 'admin_block') {
+        const target = String(msg.username).toLowerCase();
+        if (target === me) return send(ws, { type: 'error', text: 'Нельзя заблокировать себя' });
+        if (!db.users[target]) return;
+        db.users[target].blocked = !!msg.blocked;
+        saveDB();
+        const tWs = online.get(target);
+        if (tWs && db.users[target].blocked) {
+          send(tWs, { type: 'error', text: 'Вы заблокированы админом' });
+          tWs.close();
+        }
+        broadcast({ type: 'online_list', users: Object.values(db.users).map(userPublic) });
+        send(ws, { type: 'admin_users', users: Object.values(db.users).map(userPublic) });
+        return;
+      }
+      if (msg.type === 'admin_delete') {
+        const target = String(msg.username).toLowerCase();
+        if (target === me) return send(ws, { type: 'error', text: 'Нельзя удалить себя' });
+        if (!db.users[target]) return;
+        delete db.users[target];
+        saveDB();
+        const tWs = online.get(target);
+        if (tWs) { send(tWs, { type: 'error', text: 'Аккаунт удалён' }); tWs.close(); }
+        broadcast({ type: 'online_list', users: Object.values(db.users).map(userPublic) });
+        send(ws, { type: 'admin_users', users: Object.values(db.users).map(userPublic) });
+        return;
+      }
+      if (msg.type === 'admin_chats') {
+        const pairs = Object.keys(db.chats).map(k => {
+          const c = db.chats[k];
+          return { key: k, participants: c.participants, count: c.messages.length, last: c.messages.slice(-1)[0] || null };
+        });
+        return send(ws, { type: 'admin_chats', chats: pairs });
+      }
+      if (msg.type === 'admin_read_chat') {
+        const key = String(msg.key);
+        if (!db.chats[key]) return;
+        return send(ws, { type: 'admin_chat_content', key, messages: db.chats[key].messages });
+      }
+    } else if (msg.type && msg.type.startsWith('admin_')) {
+      return send(ws, { type: 'error', text: 'Недостаточно прав' });
+    }
+
+    if (msg.type === 'list_users') {
+      send(ws, { type: 'online_list', users: Object.values(db.users).map(userPublic) });
+    }
+  });
+
+  ws.on('close', () => {
+    if (me) {
+      online.delete(me);
+      broadcast({ type: 'online_list', users: Object.values(db.users).map(userPublic) });
+    }
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`GREAT v0.1.0 сервер запущен на порту ${PORT}`);
+});
